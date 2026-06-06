@@ -1,0 +1,9 @@
+[package]
+name = "icl_tool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = true, features = ["jpeg", "png"] }
+indicatif = "0.18"
