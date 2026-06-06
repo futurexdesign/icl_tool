@@ -137,6 +137,10 @@ cargo build --release
 
 The binary will be at `target/release/icl_tool`.
 
+Install 
+```bash
+cargo install --path .
+```
 ## Notes / behavior
 
 - Supports sparse index tables by using `index=path` inputs.
