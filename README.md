@@ -143,6 +143,7 @@ cargo install --path .
 ```
 ## Notes / behavior
 
-- Supports sparse index tables by using `index=path` inputs.
+- Supports sparse index tables by using `index=path` inputs, or numeric/`NN-name` filenames with `--encode`. Empty slots (missing indices) are stored as zero offsets — required for DGUS projects that skip picture IDs.
+- With `--encode`, stems like `01.jpg` and `01-home.png` both map to index `1`. If any file lacks a leading numeric index, files are packed sequentially from `0` instead (which will misalign screens on-device).
 - Uses marker-based JPEG parsing (rather than fixed offsets) to better match vendor formatting.
 - Shows progress bars only when stderr is a TTY (they auto-disable in CI / redirected output).

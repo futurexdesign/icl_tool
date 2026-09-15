@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 /// - `.jpg` / `.jpeg`
 ///
 /// Index assignment:
-/// - If **all** filenames (stems) are numeric (e.g. `0.png`, `12.jpg`) and unique, those values
-///   are used as indices.
+/// - If **all** filenames yield a numeric index and those indices are unique, those values are
+///   used (sparse slots are preserved). A stem is accepted when it is fully numeric (`12.jpg`)
+///   or begins with a decimal prefix (`01-home.png` → 1, `00005.bmp` → 5).
 /// - Otherwise, indices are assigned sequentially in lexicographic filename order starting at 0.
 ///
 /// # Arguments
@@ -47,11 +48,7 @@ pub fn collect_images_from_dir(dir: &Path) -> Result<Vec<(usize, PathBuf)>, Stri
 
     let numeric_indices: Vec<Option<usize>> = files
         .iter()
-        .map(|p| {
-            p.file_stem()
-                .and_then(OsStr::to_str)
-                .and_then(|s| s.parse::<usize>().ok())
-        })
+        .map(|p| p.file_stem().and_then(OsStr::to_str).and_then(parse_index_from_stem))
         .collect();
 
     let all_numeric = numeric_indices.iter().all(|x| x.is_some());
@@ -77,6 +74,24 @@ pub fn collect_images_from_dir(dir: &Path) -> Result<Vec<(usize, PathBuf)>, Stri
     }
 
     Ok(files.into_iter().enumerate().map(|(i, p)| (i, p)).collect())
+}
+
+/// Parse an ICL slot index from a filename stem.
+///
+/// Accepts a fully decimal stem (`12`) or a leading decimal prefix before a non-digit
+/// (`01-home`, `00005_splash`).
+fn parse_index_from_stem(stem: &str) -> Option<usize> {
+    if stem.is_empty() {
+        return None;
+    }
+    if let Ok(idx) = stem.parse::<usize>() {
+        return Some(idx);
+    }
+    let digit_len = stem.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_len == 0 || digit_len == stem.len() {
+        return None;
+    }
+    stem[..digit_len].parse().ok()
 }
 
 fn is_supported_image(path: &Path) -> bool {
@@ -137,6 +152,21 @@ mod tests {
     }
 
     #[test]
+    fn leading_digit_prefixes_preserve_sparse_indices() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("mkdir");
+        write_dummy(&dir.join("01-home.png"));
+        write_dummy(&dir.join("03-settings.png"));
+        write_dummy(&dir.join("00-splash.png"));
+        let items = collect_images_from_dir(&dir).expect("collect");
+        assert_eq!(
+            items.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 3]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn error_on_duplicate_numeric_indices() {
         let dir = unique_temp_dir();
         fs::create_dir_all(&dir).expect("mkdir");
@@ -145,6 +175,15 @@ mod tests {
         let err = collect_images_from_dir(&dir).unwrap_err();
         assert!(err.contains("Duplicate numeric image index"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_index_from_stem_accepts_prefix_and_full_numeric() {
+        assert_eq!(parse_index_from_stem("12"), Some(12));
+        assert_eq!(parse_index_from_stem("01-home"), Some(1));
+        assert_eq!(parse_index_from_stem("00005"), Some(5));
+        assert_eq!(parse_index_from_stem("splash"), None);
+        assert_eq!(parse_index_from_stem(""), None);
     }
 }
 

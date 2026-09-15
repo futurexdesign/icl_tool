@@ -246,7 +246,7 @@ fn parse_indexed_path(item: &str) -> Result<(usize, PathBuf), String> {
 ///
 /// Returns a visible progress bar on TTY stderr, or a hidden no-op bar when stderr is not a TTY.
 fn build_progress_bar(total: u64, message: &str) -> ProgressBar {
-    if !std::io::stderr().is_terminal() {
+    if !io::stderr().is_terminal() {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new(total);

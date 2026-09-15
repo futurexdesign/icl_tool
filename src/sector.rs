@@ -1,28 +1,52 @@
 //! DWIN display flash sector allocation analysis.
 //!
-//! DWIN T5L displays use 64 × 256 KiB sectors (16 MiB total). Asset filenames in
-//! `DWIN_SET` begin with a decimal sector index (e.g. `32MAIN.ICL` → sector 32).
+//! DWIN T5L displays expose 64 × 256 KiB sectors (16 MiB total). Asset filenames in
+//! `DWIN_SET` begin with a decimal sector index (for example, `32MAIN.ICL` maps to sector 32).
+//! This module scans those assets, builds a sector occupancy map, and detects overlaps.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Number of flash sectors available on a T5L display.
 pub const SECTOR_COUNT: usize = 64;
+
+/// Size of one flash sector in bytes (256 KiB).
 pub const SECTOR_SIZE: u64 = 256 * 1024;
+
+/// Total main-flash capacity in bytes (`SECTOR_COUNT × SECTOR_SIZE`).
 pub const MAX_FLASH_SIZE: u64 = SECTOR_COUNT as u64 * SECTOR_SIZE;
 
 const MAX_FILE_COUNT: usize = SECTOR_COUNT;
 
 type AppResult<T> = Result<T, String>;
 
+/// A flashable asset discovered under `DWIN_SET`.
+///
+/// The leading digits of [`file_name`](Self::file_name) encode the starting sector index
+/// stored in [`file_id`](Self::file_id). [`has_error`](Self::has_error) is set when the
+/// file participates in a sector overlap.
 #[derive(Debug, Clone)]
 pub struct DwinFile {
+    /// Basename of the asset (for example, `32MAIN.ICL`).
     pub file_name: String,
+    /// Starting sector index parsed from the filename prefix.
     pub file_id: usize,
+    /// On-disk file size in bytes.
     pub file_size: u64,
+    /// `true` when this file shares at least one sector with another file.
     pub has_error: bool,
 }
 
 impl DwinFile {
+    /// Compute how many contiguous sectors this file occupies.
+    ///
+    /// Sector usage rounds up: any non-zero payload consumes at least one sector, and payloads
+    /// larger than one sector span additional sectors as needed.
+    ///
+    /// # Returns
+    ///
+    /// Returns `0` when [`file_size`](Self::file_size) is zero; otherwise returns
+    /// `ceil(file_size / SECTOR_SIZE)`.
     pub fn sector_count(&self) -> usize {
         if self.file_size == 0 {
             return 0;
@@ -31,31 +55,65 @@ impl DwinFile {
     }
 }
 
+/// One flash sector and the files mapped into it.
 #[derive(Debug, Clone)]
 pub struct Sector {
+    /// Zero-based sector index (`0..SECTOR_COUNT`).
     pub sector_id: usize,
+    /// Files whose allocated range includes this sector (may be empty).
     pub files: Vec<DwinFile>,
 }
 
 impl Sector {
+    /// Returns whether more than one file occupies this sector.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` when [`files`](Self::files) contains two or more entries.
     pub fn has_error(&self) -> bool {
         self.files.len() > 1
     }
 
+    /// Returns whether no file is mapped to this sector.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` when [`files`](Self::files) is empty.
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
 }
 
+/// Aggregated output of the sector allocation pipeline.
 #[derive(Debug)]
 pub struct AllocationReport {
+    /// All flashable files discovered in `DWIN_SET`, with overlap flags applied.
     pub dwin_files: Vec<DwinFile>,
+    /// Full sector map (`SECTOR_COUNT` entries, indexed by sector id).
     pub sectors: Vec<Sector>,
+    /// Subset of [`dwin_files`](Self::dwin_files) flagged as overlapping.
     pub files_with_errors: Vec<DwinFile>,
+    /// Column width used when rendering file labels in the CLI report.
     pub label_width: usize,
 }
 
-/// Resolve the DWIN_SET directory from a project folder or direct path.
+/// Resolve the `DWIN_SET` directory from a project folder or a direct path.
+///
+/// If `folder_path/DWIN_SET` exists and is a directory, that path is returned. Otherwise
+/// `folder_path` itself is treated as the `DWIN_SET` directory (with a warning printed to
+/// stdout).
+///
+/// # Arguments
+///
+/// - `folder_path`: Project root or direct `DWIN_SET` directory.
+///
+/// # Returns
+///
+/// Returns the canonical absolute path to the `DWIN_SET` directory.
+///
+/// # Errors
+///
+/// Returns an error when the path does not exist or canonicalization fails.
 pub fn resolve_dwin_set_path(folder_path: &Path) -> AppResult<PathBuf> {
     if !folder_path.exists() {
         return Err(format!("{} does not exist", folder_path.display()));
@@ -77,7 +135,24 @@ pub fn resolve_dwin_set_path(folder_path: &Path) -> AppResult<PathBuf> {
         .map_err(|e| format!("Failed resolving {}: {e}", folder_path.display()))
 }
 
-/// Scan *dwin_set_path* for flashable `.ICL`, `.HZK`, and `.BIN` assets.
+/// Scan `dwin_set_path` for flashable `.ICL`, `.HZK`, and `.BIN` assets.
+///
+/// Only regular files whose names match `^\d+(.*?)\.(ICL|HZK|BIN)$` (case-insensitive) are
+/// included. Non-flashable files (for example, `T5LCFG.CFG`) are ignored.
+///
+/// # Arguments
+///
+/// - `dwin_set_path`: Canonical or relative path to the `DWIN_SET` directory.
+///
+/// # Returns
+///
+/// Returns a vector of [`DwinFile`] records sorted in directory-read order (not by sector).
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be read, a flashable filename lacks a leading
+/// sector index, more than [`SECTOR_COUNT`] flashable files are present, a file resolves
+/// outside the directory (symlink traversal), or a file exceeds [`MAX_FLASH_SIZE`].
 pub fn parse_dwin_files(dwin_set_path: &Path) -> AppResult<Vec<DwinFile>> {
     let base = dwin_set_path
         .canonicalize()
@@ -143,7 +218,21 @@ pub fn parse_dwin_files(dwin_set_path: &Path) -> AppResult<Vec<DwinFile>> {
     Ok(dwin_files)
 }
 
-/// Map each file into the sectors it occupies.
+/// Map each file into every sector its payload spans.
+///
+/// # Arguments
+///
+/// - `dwin_files`: Parsed flashable assets (typically from [`parse_dwin_files`]).
+///
+/// # Returns
+///
+/// Returns a fixed-size vector of [`SECTOR_COUNT`] [`Sector`] values. Each sector lists every
+/// file whose `[file_id, file_id + sector_count)` range includes that sector.
+///
+/// # Errors
+///
+/// Returns an error when a file's starting sector is `>= SECTOR_COUNT` or its span extends
+/// past the last sector.
 pub fn build_sector_map(dwin_files: &[DwinFile]) -> AppResult<Vec<Sector>> {
     let mut sectors: Vec<Sector> = (0..SECTOR_COUNT).map(|i| Sector { sector_id: i, files: Vec::new() }).collect();
 
@@ -172,11 +261,19 @@ pub fn build_sector_map(dwin_files: &[DwinFile]) -> AppResult<Vec<Sector>> {
     Ok(sectors)
 }
 
-/// Flag every file involved in a sector conflict.
+/// Flag every file that occupies at least one sector with a conflict.
+///
+/// A sector conflict exists when two or more files map to the same sector. All files involved
+/// in such a sector have [`DwinFile::has_error`] set to `true`.
+///
+/// # Arguments
+///
+/// - `dwin_files`: Mutable file list to update in place.
+/// - `sectors`: Sector map produced by [`build_sector_map`].
 pub fn mark_overlapping_files(dwin_files: &mut [DwinFile], sectors: &[Sector]) {
     for dwin_file in dwin_files.iter_mut() {
-        for sector_id in dwin_file.file_id..=dwin_file.file_id + dwin_file.sector_count() {
-            if sector_id < SECTOR_COUNT && sectors[sector_id].has_error() {
+        for sector_id in dwin_file.file_id..dwin_file.file_id + dwin_file.sector_count() {
+            if sectors[sector_id].has_error() {
                 dwin_file.has_error = true;
                 break;
             }
@@ -184,7 +281,22 @@ pub fn mark_overlapping_files(dwin_files: &mut [DwinFile], sectors: &[Sector]) {
     }
 }
 
-/// Run the full analysis pipeline.
+/// Run the full sector allocation analysis pipeline.
+///
+/// Parses flashable files, builds the sector map, flags overlaps, and computes report layout
+/// metadata.
+///
+/// # Arguments
+///
+/// - `dwin_set_path`: Path to the `DWIN_SET` directory (already resolved).
+///
+/// # Returns
+///
+/// Returns an [`AllocationReport`] containing files, sectors, overlapping files, and label width.
+///
+/// # Errors
+///
+/// Propagates errors from [`parse_dwin_files`] and [`build_sector_map`].
 pub fn analyze(dwin_set_path: &Path) -> AppResult<AllocationReport> {
     let dwin_files = parse_dwin_files(dwin_set_path)?;
     let sectors = build_sector_map(&dwin_files)?;
@@ -208,12 +320,17 @@ pub fn analyze(dwin_set_path: &Path) -> AppResult<AllocationReport> {
     })
 }
 
-/// Print the colour-coded sector map and summary banner.
+/// Print the colour-coded sector map and overlap summary to stdout.
+///
+/// # Arguments
+///
+/// - `report`: Analysis output from [`analyze`].
 pub fn render_report(report: &AllocationReport) {
     render_allocation(report);
     render_result(report);
 }
 
+/// Render the sector grid and per-file usage rows.
 fn render_allocation(report: &AllocationReport) {
     let label_width = report.label_width;
     let sectors = &report.sectors;
@@ -265,6 +382,7 @@ fn render_allocation(report: &AllocationReport) {
     println!();
 }
 
+/// Render the success banner or the overlapping-files error summary.
 fn render_result(report: &AllocationReport) {
     if report.files_with_errors.is_empty() {
         println!(
@@ -291,6 +409,8 @@ fn render_result(report: &AllocationReport) {
     );
 }
 
+/// Returns whether `name` is a flashable DWIN asset filename.
+///
 /// Matches Python's `^\d+(.*?)\.(ICL|HZK|BIN)$` (case-insensitive).
 fn is_flashable_filename(name: &str) -> bool {
     let digit_len = name.chars().take_while(|c| c.is_ascii_digit()).count();
@@ -301,7 +421,7 @@ fn is_flashable_filename(name: &str) -> bool {
     upper.ends_with(".ICL") || upper.ends_with(".HZK") || upper.ends_with(".BIN")
 }
 
-/// Round like Python 3's `round()` (half-to-even).
+/// Round a floating-point kilobyte value like Python 3's built-in `round()` (half-to-even).
 fn round_half_even(value: f64) -> i64 {
     let rounded = value.round();
     if (value - value.floor() - 0.5).abs() < f64::EPSILON && (rounded as i64) % 2 != 0 {
@@ -311,6 +431,15 @@ fn round_half_even(value: f64) -> i64 {
     }
 }
 
+/// Parse the leading decimal sector index from a flashable filename.
+///
+/// # Arguments
+///
+/// - `name`: Basename such as `32MAIN.ICL`.
+///
+/// # Returns
+///
+/// Returns `Some(index)` when the name begins with one or more ASCII digits; otherwise `None`.
 fn parse_file_id(name: &str) -> Option<usize> {
     let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() {
@@ -489,6 +618,17 @@ mod tests {
     }
 
     #[test]
+    fn out_of_bounds_span_raises() {
+        let f = DwinFile {
+            file_name: "63BAD.BIN".into(),
+            file_id: SECTOR_COUNT - 1,
+            file_size: 2 * SECTOR_SIZE,
+            has_error: false,
+        };
+        assert!(build_sector_map(&[f]).is_err());
+    }
+
+    #[test]
     fn parse_dwin_files_filters_and_reads() {
         let dir = unique_temp_dir("sector_parse");
         fs::create_dir_all(&dir).expect("mkdir");
@@ -504,6 +644,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_dwin_files_accepts_case_insensitive_extensions() {
+        let dir = unique_temp_dir("sector_case");
+        fs::create_dir_all(&dir).expect("mkdir");
+        write_file(&dir, "5logo.icl", b"x");
+        write_file(&dir, "6font.hzk", b"x");
+        write_file(&dir, "7data.bin", b"x");
+
+        let files = parse_dwin_files(&dir).expect("parse");
+        assert_eq!(files.len(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_dwin_files_rejects_oversized_file() {
+        let dir = unique_temp_dir("sector_oversize");
+        fs::create_dir_all(&dir).expect("mkdir");
+        write_file(&dir, "0BIG.BIN", &vec![0u8; MAX_FLASH_SIZE as usize + 1]);
+
+        let err = parse_dwin_files(&dir).expect_err("oversize");
+        assert!(err.contains("exceeds the total flash capacity"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn mark_overlapping_files_flags_conflicts() {
         let f1 = make_file(0, 3, None);
         let f2 = make_file(2, 1, Some("2B.BIN"));
@@ -511,6 +675,17 @@ mod tests {
         let mut files = vec![f1, f2];
         mark_overlapping_files(&mut files, &sectors);
         assert!(files.iter().all(|f| f.has_error));
+    }
+
+    #[test]
+    fn mark_overlapping_files_does_not_scan_extra_sector() {
+        let f1 = make_file(0, 3, None);
+        let sectors = build_sector_map(&[f1.clone()]).expect("map");
+        assert!(!sectors[3].has_error());
+
+        let mut files = vec![f1];
+        mark_overlapping_files(&mut files, &sectors);
+        assert!(!files[0].has_error);
     }
 
     #[test]
@@ -539,5 +714,83 @@ mod tests {
         mark_overlapping_files(&mut files, &sectors);
         assert_eq!(files.iter().filter(|f| f.has_error).count(), 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn analyze_reports_clean_allocation() {
+        let dir = unique_temp_dir("sector_analyze_ok");
+        fs::create_dir_all(&dir).expect("mkdir");
+        write_file(&dir, "0A.BIN", &vec![b'x'; SECTOR_SIZE as usize]);
+        write_file(&dir, "2B.BIN", &vec![b'x'; SECTOR_SIZE as usize]);
+
+        let report = analyze(&dir).expect("analyze");
+        assert_eq!(report.dwin_files.len(), 2);
+        assert!(report.files_with_errors.is_empty());
+        assert!(report.label_width >= "0A.BIN".len() + 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn analyze_reports_overlap() {
+        let dir = unique_temp_dir("sector_analyze_bad");
+        fs::create_dir_all(&dir).expect("mkdir");
+        write_file(&dir, "0A.BIN", &vec![b'x'; (2 * SECTOR_SIZE) as usize]);
+        write_file(&dir, "1B.BIN", b"x");
+
+        let report = analyze(&dir).expect("analyze");
+        assert_eq!(report.files_with_errors.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_dwin_set_path_from_project_root() {
+        let project = unique_temp_dir("sector_project");
+        let dwin_set = project.join("DWIN_SET");
+        fs::create_dir_all(&dwin_set).expect("mkdir");
+
+        let resolved = resolve_dwin_set_path(&project).expect("resolve");
+        assert_eq!(resolved, dwin_set.canonicalize().expect("canonical"));
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn resolve_dwin_set_path_from_direct_folder() {
+        let dir = unique_temp_dir("sector_direct");
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        let resolved = resolve_dwin_set_path(&dir).expect("resolve");
+        assert_eq!(resolved, dir.canonicalize().expect("canonical"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_dwin_set_path_missing_path() {
+        let missing = unique_temp_dir("sector_missing");
+        assert!(resolve_dwin_set_path(&missing).is_err());
+    }
+
+    #[test]
+    fn is_flashable_filename_matches_expected_patterns() {
+        assert!(is_flashable_filename("32MAIN.ICL"));
+        assert!(is_flashable_filename("0LOGO.hzk"));
+        assert!(is_flashable_filename("10DATA.bin"));
+        assert!(!is_flashable_filename("T5LCFG.CFG"));
+        assert!(!is_flashable_filename("MAIN.ICL"));
+        assert!(!is_flashable_filename("32MAIN.JPG"));
+    }
+
+    #[test]
+    fn parse_file_id_extracts_leading_digits() {
+        assert_eq!(parse_file_id("32MAIN.ICL"), Some(32));
+        assert_eq!(parse_file_id("0LOGO.ICL"), Some(0));
+        assert_eq!(parse_file_id("MAIN.ICL"), None);
+    }
+
+    #[test]
+    fn round_half_even_matches_python() {
+        assert_eq!(round_half_even(2.5), 2);
+        assert_eq!(round_half_even(3.5), 4);
+        assert_eq!(round_half_even(256.0), 256);
+        assert_eq!(round_half_even(255.5), 256);
     }
 }
